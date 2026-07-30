@@ -41,27 +41,35 @@ def _load_result_cached(path: str, mtime: float, label: str) -> ResultFile:
     group = sdf.load(path)
     rf = ResultFile(path=path, label=label)
 
-    for ds in group.datasets:
-        name = ds.name
-        if name == "Time":
-            continue
-        data = np.asarray(ds.data)
-        unit = _unit_of(ds)
-        if data.ndim == 0:
-            rf.params[name] = float(data)
-            rf.param_units[name] = unit
-        else:
-            rf.series[name] = data
-            rf.units[name] = unit
-            scale = ds.scales[0] if ds.scales else None
-            if scale is not None:
-                rf.time[name] = np.asarray(scale.data)
+    try:
+        fallback_time = np.asarray(group["Time"].data)
+    except KeyError:
+        fallback_time = None
+
+    def walk(g, prefix: str) -> None:
+        for ds in g.datasets:
+            name = prefix + ds.name
+            if name == "Time":
+                continue
+            data = np.asarray(ds.data)
+            unit = _unit_of(ds)
+            if data.ndim == 0:
+                rf.params[name] = float(data)
+                rf.param_units[name] = unit
             else:
-                # fall back to the file's own Time dataset
-                try:
-                    rf.time[name] = np.asarray(group["Time"].data)
-                except KeyError:
+                rf.series[name] = data
+                rf.units[name] = unit
+                scale = ds.scales[0] if ds.scales else None
+                if scale is not None:
+                    rf.time[name] = np.asarray(scale.data)
+                elif fallback_time is not None:
+                    rf.time[name] = fallback_time
+                else:
                     rf.time[name] = np.arange(data.shape[0], dtype=float)
+        for sub in g.groups:
+            walk(sub, prefix + sub.name + ".")
+
+    walk(group, "")
 
     return rf
 

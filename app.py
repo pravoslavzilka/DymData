@@ -82,19 +82,32 @@ groups = group_variables(all_var_names)
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Variables")
-    search = st.text_input("Filter (substring, case-insensitive)", "")
+    top_level_names = [n for n in all_var_names if "." not in n]
+    search = st.text_input(
+        "Filter (substring, case-insensitive)",
+        "",
+        help=(
+            "Empty shows only top-level variables. Type a component name "
+            "(e.g. 'sensorT' or 'valve1.') to search the full nested "
+            "Modelica hierarchy, e.g. sensorT.valueSensor."
+        ),
+    )
     search_l = search.lower().strip()
-    filtered = [n for n in all_var_names if search_l in n.lower()] if search_l else all_var_names
+    filtered = [n for n in all_var_names if search_l in n.lower()] if search_l else top_level_names
 
     if "selected_vars" not in st.session_state:
         st.session_state["selected_vars"] = []
 
+    MAX_ADD = 300
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("Add filtered", width="stretch"):
+        add_disabled = len(filtered) > MAX_ADD
+        if st.button("Add filtered", width="stretch", disabled=add_disabled):
             cur = set(st.session_state["selected_vars"])
             cur.update(filtered)
             st.session_state["selected_vars"] = sorted(cur)
+        if add_disabled:
+            st.caption(f"Narrow the filter below {MAX_ADD} matches to add in bulk ({len(filtered)} match).")
     with col_b:
         if st.button("Clear", width="stretch"):
             st.session_state["selected_vars"] = []
@@ -107,7 +120,10 @@ with st.sidebar:
     )
     selected_vars = st.session_state["selected_vars"]
 
-    st.caption(f"{len(all_var_names)} variables available in {len(groups)} groups.")
+    st.caption(
+        f"{len(all_var_names)} variables available ({len(top_level_names)} top-level) "
+        f"in {len(groups)} groups."
+    )
 
 if not selected_vars:
     st.info("Pick one or more variables in the sidebar to plot.")
