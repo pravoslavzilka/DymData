@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 
@@ -38,6 +39,7 @@ def save_settings() -> None:
         "charts": st.session_state.get("charts", []),
         "active_chart_id": st.session_state.get("active_chart_id"),
         "next_chart_id": st.session_state.get("next_chart_id", 0),
+        "basic_params": st.session_state.get("basic_params", []),
     }
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
@@ -81,6 +83,8 @@ if _saved:
         st.session_state["next_chart_id"] = _saved.get(
             "next_chart_id", max(c["id"] for c in saved_charts)
         )
+    if _saved.get("basic_params"):
+        st.session_state["basic_params"] = _saved["basic_params"]
 
 # ---------------------------------------------------------------------------
 # Sidebar: locate result files
@@ -130,22 +134,75 @@ def _column_file_picker(container, col_key: str, default_index: int) -> tuple[st
     return sel_path, file_labels[sel_path]
 
 
+# ---------------------------------------------------------------------------
+# Basic-parameters comparison: pick a short list of scalar parameters (e.g.
+# PID.k, PID.Ti) and compare their values for the two loaded runs.
+# ---------------------------------------------------------------------------
+def _param_differs(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return a is not b
+    try:
+        return not math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+    except TypeError:
+        return a != b
+
+
+@st.dialog("Configure basic parameters")
+def _configure_basic_params_dialog(all_params: list[str]) -> None:
+    current = [p for p in st.session_state.get("basic_params", []) if p in all_params]
+    picked = st.multiselect(
+        "Parameters to compare",
+        options=all_params,
+        default=current,
+        help="Pick scalar parameters (e.g. PID.k, PID.Ti) to show side by side for the two runs.",
+    )
+    if st.button("Save", type="primary"):
+        st.session_state["basic_params"] = picked
+        st.rerun()
+
+
+@st.dialog("Compare run parameters", width="large")
+def _show_param_compare_dialog(rf_a: ResultFile, rf_b: ResultFile) -> None:
+    basic_params = st.session_state.get("basic_params", [])
+    if not basic_params:
+        st.info("No parameters configured yet — use the “⚙ Configure basic parameters” button below the overview table.")
+        return
+    col1, col2 = st.columns(2)
+    for col, rf, other in ((col1, rf_a, rf_b), (col2, rf_b, rf_a)):
+        with col:
+            st.subheader(rf.label)
+            for p in basic_params:
+                val = rf.params.get(p)
+                other_val = other.params.get(p)
+                unit = rf.param_units.get(p, "") or other.param_units.get(p, "")
+                shown = f"{val:g}" if val is not None else "—"
+                text = f"**{p}** = {shown}" + (f" {unit}" if unit else "")
+                if _param_differs(val, other_val):
+                    st.markdown(f":red[{text}]")
+                else:
+                    st.markdown(text)
+
+
 with tab_charts:
     outer_a, outer_b = st.columns(2)
     with outer_a:
         head_a = st.columns([6, 1])
         path_a, label_a = _column_file_picker(head_a[1], "col_a", default_index=0)
-        head_a[0].subheader(label_a)
     with outer_b:
         head_b = st.columns([6, 1])
         path_b, label_b = _column_file_picker(head_b[1], "col_b", default_index=1 if len(files) > 1 else 0)
-        head_b[0].subheader(label_b)
 
 col_a_result = load_result(path_a, label=label_a)
 col_b_result = load_result(path_b, label=label_b)
 results: list[ResultFile] = [col_a_result, col_b_result]
+all_param_names = parameter_names(results)
 
 with tab_charts:
+    if head_a[0].button(f"**{label_a}**", key="title_btn_a", type="tertiary", help="Compare basic parameters for both runs"):
+        _show_param_compare_dialog(col_a_result, col_b_result)
+    if head_b[0].button(f"**{label_b}**", key="title_btn_b", type="tertiary", help="Compare basic parameters for both runs"):
+        _show_param_compare_dialog(col_a_result, col_b_result)
+
     overview_rows = []
     for rf in results:
         n_points = max((len(v) for v in rf.time.values()), default=0)
@@ -160,6 +217,8 @@ with tab_charts:
             }
         )
     st.dataframe(pd.DataFrame(overview_rows), hide_index=True, width="stretch", height=110)
+    if st.button("⚙ Configure basic parameters"):
+        _configure_basic_params_dialog(all_param_names)
 
 all_var_names = variable_names(results)
 groups = group_variables(all_var_names)
@@ -353,7 +412,7 @@ def render_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[Result
             y="value",
             color="file",
             facet_row="variable_label",
-            height=max(300, 260 * n_vars),
+            height=max(220, 180 * n_vars),
         )
         fig.update_yaxes(matches=None)
         fig.for_each_annotation(lambda a: a.update(text=a.text.split("=", 1)[-1]))
@@ -404,7 +463,7 @@ def render_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[Result
     fig.update_layout(
         legend_title_text="",
         margin=dict(t=40, b=20),
-        height=500,
+        height=350,
         hovermode="x unified",
         hoverlabel=dict(font_size=16),
     )
