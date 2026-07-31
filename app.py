@@ -1,6 +1,7 @@
 """Streamlit app for browsing and plotting Dymola simulation results (.mat via sdf)."""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
@@ -16,6 +17,33 @@ from dymola_app.treeutils import group_variables
 DEFAULT_DIR = r"D:\projects\IPP\Cryogenics\Dymola\compass-u-cryo-loop\dymola-thermal-systems\data\PF\overCoolStabilize delay"
 DASH_STYLES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
 MAX_BULK_ADD = 300
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dymdata_settings.json")
+
+
+def load_settings() -> dict:
+    """Read persisted app settings from disk (empty dict if none/invalid)."""
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_settings() -> None:
+    """Persist the current directory, file selection and charts to disk."""
+    data = {
+        "directory": st.session_state.get("directory_input", DEFAULT_DIR),
+        "col_a_select": st.session_state.get("col_a_select"),
+        "col_b_select": st.session_state.get("col_b_select"),
+        "charts": st.session_state.get("charts", []),
+        "active_chart_id": st.session_state.get("active_chart_id"),
+        "next_chart_id": st.session_state.get("next_chart_id", 0),
+    }
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except OSError:
+        pass
 
 
 def clean_label(name_or_path: str) -> str:
@@ -32,12 +60,42 @@ st.set_page_config(page_title="Dymola Results Viewer", layout="wide")
 st.title("Dymola Results Viewer")
 
 # ---------------------------------------------------------------------------
+# Restore persisted settings (once per session, on first load only) so the
+# app reopens showing the same directory, files and charts as last time.
+# ---------------------------------------------------------------------------
+if "_settings_restored" not in st.session_state:
+    st.session_state["_settings_restored"] = True
+    _saved = load_settings()
+else:
+    _saved = None
+
+if _saved:
+    st.session_state["directory_input"] = _saved.get("directory", DEFAULT_DIR)
+    saved_charts = _saved.get("charts") or []
+    for _chart in saved_charts:
+        if _chart.get("time_range") is not None:
+            _chart["time_range"] = tuple(_chart["time_range"])
+    if saved_charts:
+        st.session_state["charts"] = saved_charts
+        st.session_state["active_chart_id"] = _saved.get("active_chart_id", saved_charts[0]["id"])
+        st.session_state["next_chart_id"] = _saved.get(
+            "next_chart_id", max(c["id"] for c in saved_charts)
+        )
+
+# ---------------------------------------------------------------------------
 # Sidebar: locate result files
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Results")
-    directory = st.text_input("Results directory", value=DEFAULT_DIR)
+    if "directory_input" not in st.session_state:
+        st.session_state["directory_input"] = DEFAULT_DIR
+    directory = st.text_input("Results directory", key="directory_input")
     files = list_result_files(directory)
+
+    if _saved:
+        for _key, _path in (("col_a_select", _saved.get("col_a_select")), ("col_b_select", _saved.get("col_b_select"))):
+            if _path and _path in files:
+                st.session_state[_key] = _path
 
     if not files:
         st.warning("No .mat files found in that directory.")
@@ -52,14 +110,16 @@ tab_charts, tab_params, tab_data = st.tabs(["Charts", "Parameters", "Data"])
 # Per-column file picker (small popover: pick an existing file or upload one)
 # ---------------------------------------------------------------------------
 def _column_file_picker(container, col_key: str, default_index: int) -> tuple[str, str]:
+    select_key = f"{col_key}_select"
+    if select_key not in st.session_state:
+        st.session_state[select_key] = files[min(default_index, len(files) - 1)]
     with container:
         with st.popover("📁", help="Change or upload the file shown in this column"):
             sel_path = st.selectbox(
                 "Existing file",
                 options=files,
-                index=min(default_index, len(files) - 1),
                 format_func=lambda p: file_labels[p],
-                key=f"{col_key}_select",
+                key=select_key,
             )
             up = st.file_uploader("...or upload a .mat file", type="mat", key=f"{col_key}_upload")
     if up is not None:
@@ -235,7 +295,13 @@ with st.sidebar:
         else:
             time_key = _widget_key("time", active_id)
             if time_key not in st.session_state:
-                st.session_state[time_key] = (t_min, t_max)
+                stored_range = active_chart.get("time_range")
+                if stored_range and len(stored_range) == 2:
+                    lo = min(max(stored_range[0], t_min), t_max)
+                    hi = min(max(stored_range[1], t_min), t_max)
+                    st.session_state[time_key] = (lo, hi) if lo <= hi else (t_min, t_max)
+                else:
+                    st.session_state[time_key] = (t_min, t_max)
             else:
                 lo, hi = st.session_state[time_key]
                 lo = min(max(lo, t_min), t_max)
@@ -502,3 +568,9 @@ with tab_data:
             )
         if skipped:
             st.caption(f"Skipped (different time grid than the first variable): {', '.join(skipped)}")
+
+# ---------------------------------------------------------------------------
+# Persist current settings so the same directory, files and charts come
+# back the next time the app is opened.
+# ---------------------------------------------------------------------------
+save_settings()
