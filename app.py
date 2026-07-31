@@ -21,6 +21,33 @@ DASH_STYLES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
 MAX_BULK_ADD = 300
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dymdata_settings.json")
 
+# Raw unit -> alternative display units as (label, scale, offset), where
+# display_value = raw_value * scale + offset.
+UNIT_ALTERNATIVES: dict[str, list[tuple[str, float, float]]] = {
+    "K": [("K", 1.0, 0.0), ("degC", 1.0, -273.15), ("degF", 9 / 5, -459.67)],
+    "Pa": [("Pa", 1.0, 0.0), ("kPa", 1e-3, 0.0), ("MPa", 1e-6, 0.0), ("bar", 1e-5, 0.0)],
+    "s": [("s", 1.0, 0.0), ("min", 1 / 60, 0.0), ("h", 1 / 3600, 0.0)],
+    "W": [("W", 1.0, 0.0), ("kW", 1e-3, 0.0), ("MW", 1e-6, 0.0)],
+    "J": [("J", 1.0, 0.0), ("kJ", 1e-3, 0.0), ("MJ", 1e-6, 0.0), ("kWh", 1 / 3.6e6, 0.0)],
+    "kg/s": [("kg/s", 1.0, 0.0), ("g/s", 1e3, 0.0)],
+    "m": [("m", 1.0, 0.0), ("mm", 1e3, 0.0), ("cm", 1e2, 0.0), ("km", 1e-3, 0.0)],
+    "m3/s": [("m3/s", 1.0, 0.0), ("l/s", 1e3, 0.0), ("l/min", 1e3 * 60, 0.0)],
+}
+
+
+def _convert_for_display(values: np.ndarray, unit: str) -> tuple[np.ndarray, str]:
+    """Rescale `values` to the user's preferred display unit for `unit`, if configured."""
+    alts = UNIT_ALTERNATIVES.get(unit)
+    if not alts:
+        return values, unit
+    target = st.session_state.get("unit_prefs", {}).get(unit, unit)
+    for label, scale, offset in alts:
+        if label == target:
+            if scale == 1.0 and offset == 0.0:
+                return values, label
+            return values * scale + offset, label
+    return values, unit
+
 
 def load_settings() -> dict:
     """Read persisted app settings from disk (empty dict if none/invalid)."""
@@ -41,6 +68,7 @@ def save_settings() -> None:
         "active_chart_id": st.session_state.get("active_chart_id"),
         "next_chart_id": st.session_state.get("next_chart_id", 0),
         "basic_params": st.session_state.get("basic_params", []),
+        "unit_prefs": st.session_state.get("unit_prefs", {}),
     }
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
@@ -88,6 +116,8 @@ if _saved:
         )
     if _saved.get("basic_params"):
         st.session_state["basic_params"] = _saved["basic_params"]
+    if _saved.get("unit_prefs"):
+        st.session_state["unit_prefs"] = _saved["unit_prefs"]
 
 # ---------------------------------------------------------------------------
 # Sidebar: locate result files
@@ -150,6 +180,29 @@ def _param_differs(a: float | None, b: float | None) -> bool:
         return a != b
 
 
+@st.dialog("Configure display units")
+def _configure_display_units_dialog(units: list[str]) -> None:
+    if not units:
+        st.info("No convertible units among the currently loaded variables.")
+        return
+    prefs = st.session_state.get("unit_prefs", {})
+    new_prefs = {}
+    for u in units:
+        alts = [label for label, _, _ in UNIT_ALTERNATIVES[u]]
+        current = prefs.get(u, u)
+        if current not in alts:
+            current = u
+        new_prefs[u] = st.selectbox(
+            f"Display “{u}” as",
+            options=alts,
+            index=alts.index(current),
+            key=f"unit_pref_picker_{u}",
+        )
+    if st.button("Save", type="primary"):
+        st.session_state["unit_prefs"] = new_prefs
+        st.rerun()
+
+
 @st.dialog("Configure basic parameters")
 def _configure_basic_params_dialog(all_params: list[str]) -> None:
     current = [p for p in st.session_state.get("basic_params", []) if p in all_params]
@@ -199,6 +252,7 @@ col_a_result = load_result(path_a, label=label_a)
 col_b_result = load_result(path_b, label=label_b)
 results: list[ResultFile] = [col_a_result, col_b_result]
 all_param_names = parameter_names(results)
+available_units = sorted({u for rf in results for u in rf.units.values() if u in UNIT_ALTERNATIVES})
 
 with tab_charts:
     if head_a[0].button(f"**{label_a}**", key="title_btn_a", type="tertiary", help="Compare basic parameters for both runs"):
@@ -220,8 +274,13 @@ with tab_charts:
             }
         )
     st.dataframe(pd.DataFrame(overview_rows), hide_index=True, width="stretch", height=110)
-    if st.button("⚙ Configure basic parameters"):
-        _configure_basic_params_dialog(all_param_names)
+    _, settings_col1, settings_col2, _ = st.columns([3, 1, 1, 3])
+    with settings_col1:
+        if st.button("⚙ Configure basic parameters", width="stretch"):
+            _configure_basic_params_dialog(all_param_names)
+    with settings_col2:
+        if st.button("⚙ Configure display units", width="stretch"):
+            _configure_display_units_dialog(available_units)
 
 all_var_names = variable_names(results)
 groups = group_variables(all_var_names)
@@ -423,8 +482,7 @@ def build_dependent_chart_df(chart: dict, results_list: list[ResultFile]) -> pd.
         if x_var not in rf.series:
             continue
         t_x = rf.time[x_var]
-        v_x = rf.series[x_var]
-        x_unit = rf.units.get(x_var, "")
+        v_x, x_unit = _convert_for_display(rf.series[x_var], rf.units.get(x_var, ""))
         for y in y_vars:
             if y not in rf.series or y == x_var:
                 continue
@@ -435,7 +493,7 @@ def build_dependent_chart_df(chart: dict, results_list: list[ResultFile]) -> pd.
             else:
                 order = np.argsort(t_y)
                 v_y_aligned = np.interp(t_x, t_y[order], v_y[order])
-            y_unit = rf.units.get(y, "")
+            v_y_aligned, y_unit = _convert_for_display(v_y_aligned, rf.units.get(y, ""))
             frames.append(
                 pd.DataFrame(
                     {
@@ -506,11 +564,11 @@ def build_time_chart_df(chart: dict, results_list: list[ResultFile]) -> pd.DataF
                 continue
             t = rf.time[var]
             v = rf.series[var]
-            unit = rf.units.get(var, "")
             mask = (t >= t_range[0]) & (t <= t_range[1]) if t_range else slice(None)
             t_sel, v_sel = (t[mask], v[mask]) if t_range else (t, v)
             if t_range and not mask.any():
                 continue
+            v_sel, unit = _convert_for_display(v_sel, rf.units.get(var, ""))
             label = f"{var} [{unit}]" if unit else var
             frames.append(
                 pd.DataFrame(
