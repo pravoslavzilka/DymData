@@ -1,9 +1,12 @@
 """Streamlit app for browsing and plotting Dymola simulation results (.mat via sdf)."""
 from __future__ import annotations
 
+import json
+import math
 import os
 import tempfile
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -16,6 +19,34 @@ from dymola_app.treeutils import group_variables
 DEFAULT_DIR = r"D:\projects\IPP\Cryogenics\Dymola\compass-u-cryo-loop\dymola-thermal-systems\data\PF\overCoolStabilize delay"
 DASH_STYLES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
 MAX_BULK_ADD = 300
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dymdata_settings.json")
+
+
+def load_settings() -> dict:
+    """Read persisted app settings from disk (empty dict if none/invalid)."""
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_settings() -> None:
+    """Persist the current directory, file selection and charts to disk."""
+    data = {
+        "directory": st.session_state.get("directory_input", DEFAULT_DIR),
+        "col_a_select": st.session_state.get("col_a_select"),
+        "col_b_select": st.session_state.get("col_b_select"),
+        "charts": st.session_state.get("charts", []),
+        "active_chart_id": st.session_state.get("active_chart_id"),
+        "next_chart_id": st.session_state.get("next_chart_id", 0),
+        "basic_params": st.session_state.get("basic_params", []),
+    }
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except OSError:
+        pass
 
 
 def clean_label(name_or_path: str) -> str:
@@ -32,12 +63,46 @@ st.set_page_config(page_title="Dymola Results Viewer", layout="wide")
 st.title("Dymola Results Viewer")
 
 # ---------------------------------------------------------------------------
+# Restore persisted settings (once per session, on first load only) so the
+# app reopens showing the same directory, files and charts as last time.
+# ---------------------------------------------------------------------------
+if "_settings_restored" not in st.session_state:
+    st.session_state["_settings_restored"] = True
+    _saved = load_settings()
+else:
+    _saved = None
+
+if _saved:
+    st.session_state["directory_input"] = _saved.get("directory", DEFAULT_DIR)
+    saved_charts = _saved.get("charts") or []
+    for _chart in saved_charts:
+        _chart.setdefault("chart_type", "time")
+        _chart.setdefault("x_var", None)
+        if _chart.get("time_range") is not None:
+            _chart["time_range"] = tuple(_chart["time_range"])
+    if saved_charts:
+        st.session_state["charts"] = saved_charts
+        st.session_state["active_chart_id"] = _saved.get("active_chart_id", saved_charts[0]["id"])
+        st.session_state["next_chart_id"] = _saved.get(
+            "next_chart_id", max(c["id"] for c in saved_charts)
+        )
+    if _saved.get("basic_params"):
+        st.session_state["basic_params"] = _saved["basic_params"]
+
+# ---------------------------------------------------------------------------
 # Sidebar: locate result files
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Results")
-    directory = st.text_input("Results directory", value=DEFAULT_DIR)
+    if "directory_input" not in st.session_state:
+        st.session_state["directory_input"] = DEFAULT_DIR
+    directory = st.text_input("Results directory", key="directory_input")
     files = list_result_files(directory)
+
+    if _saved:
+        for _key, _path in (("col_a_select", _saved.get("col_a_select")), ("col_b_select", _saved.get("col_b_select"))):
+            if _path and _path in files:
+                st.session_state[_key] = _path
 
     if not files:
         st.warning("No .mat files found in that directory.")
@@ -52,14 +117,16 @@ tab_charts, tab_params, tab_data = st.tabs(["Charts", "Parameters", "Data"])
 # Per-column file picker (small popover: pick an existing file or upload one)
 # ---------------------------------------------------------------------------
 def _column_file_picker(container, col_key: str, default_index: int) -> tuple[str, str]:
+    select_key = f"{col_key}_select"
+    if select_key not in st.session_state:
+        st.session_state[select_key] = files[min(default_index, len(files) - 1)]
     with container:
         with st.popover("📁", help="Change or upload the file shown in this column"):
             sel_path = st.selectbox(
                 "Existing file",
                 options=files,
-                index=min(default_index, len(files) - 1),
                 format_func=lambda p: file_labels[p],
-                key=f"{col_key}_select",
+                key=select_key,
             )
             up = st.file_uploader("...or upload a .mat file", type="mat", key=f"{col_key}_upload")
     if up is not None:
@@ -70,22 +137,75 @@ def _column_file_picker(container, col_key: str, default_index: int) -> tuple[st
     return sel_path, file_labels[sel_path]
 
 
+# ---------------------------------------------------------------------------
+# Basic-parameters comparison: pick a short list of scalar parameters (e.g.
+# PID.k, PID.Ti) and compare their values for the two loaded runs.
+# ---------------------------------------------------------------------------
+def _param_differs(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return a is not b
+    try:
+        return not math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+    except TypeError:
+        return a != b
+
+
+@st.dialog("Configure basic parameters")
+def _configure_basic_params_dialog(all_params: list[str]) -> None:
+    current = [p for p in st.session_state.get("basic_params", []) if p in all_params]
+    picked = st.multiselect(
+        "Parameters to compare",
+        options=all_params,
+        default=current,
+        help="Pick scalar parameters (e.g. PID.k, PID.Ti) to show side by side for the two runs.",
+    )
+    if st.button("Save", type="primary"):
+        st.session_state["basic_params"] = picked
+        st.rerun()
+
+
+@st.dialog("Compare run parameters", width="large")
+def _show_param_compare_dialog(rf_a: ResultFile, rf_b: ResultFile) -> None:
+    basic_params = st.session_state.get("basic_params", [])
+    if not basic_params:
+        st.info("No parameters configured yet — use the “⚙ Configure basic parameters” button below the overview table.")
+        return
+    col1, col2 = st.columns(2)
+    for col, rf, other in ((col1, rf_a, rf_b), (col2, rf_b, rf_a)):
+        with col:
+            st.subheader(rf.label)
+            for p in basic_params:
+                val = rf.params.get(p)
+                other_val = other.params.get(p)
+                unit = rf.param_units.get(p, "") or other.param_units.get(p, "")
+                shown = f"{val:g}" if val is not None else "—"
+                text = f"**{p}** = {shown}" + (f" {unit}" if unit else "")
+                if _param_differs(val, other_val):
+                    st.markdown(f":red[{text}]")
+                else:
+                    st.markdown(text)
+
+
 with tab_charts:
     outer_a, outer_b = st.columns(2)
     with outer_a:
         head_a = st.columns([6, 1])
         path_a, label_a = _column_file_picker(head_a[1], "col_a", default_index=0)
-        head_a[0].subheader(label_a)
     with outer_b:
         head_b = st.columns([6, 1])
         path_b, label_b = _column_file_picker(head_b[1], "col_b", default_index=1 if len(files) > 1 else 0)
-        head_b[0].subheader(label_b)
 
 col_a_result = load_result(path_a, label=label_a)
 col_b_result = load_result(path_b, label=label_b)
 results: list[ResultFile] = [col_a_result, col_b_result]
+all_param_names = parameter_names(results)
 
 with tab_charts:
+    if head_a[0].button(f"**{label_a}**", key="title_btn_a", type="tertiary", help="Compare basic parameters for both runs"):
+        _show_param_compare_dialog(col_a_result, col_b_result)
+    if head_b[0].button(f"**{label_b}**", key="title_btn_b", type="tertiary", help="Compare basic parameters for both runs"):
+        _show_param_compare_dialog(col_a_result, col_b_result)
+
     overview_rows = []
     for rf in results:
         n_points = max((len(v) for v in rf.time.values()), default=0)
@@ -100,6 +220,8 @@ with tab_charts:
             }
         )
     st.dataframe(pd.DataFrame(overview_rows), hide_index=True, width="stretch", height=110)
+    if st.button("⚙ Configure basic parameters"):
+        _configure_basic_params_dialog(all_param_names)
 
 all_var_names = variable_names(results)
 groups = group_variables(all_var_names)
@@ -107,14 +229,16 @@ groups = group_variables(all_var_names)
 # ---------------------------------------------------------------------------
 # Multi-chart state
 # ---------------------------------------------------------------------------
-def _new_chart(name: str) -> dict:
+def _new_chart(name: str, chart_type: str = "time") -> dict:
     st.session_state["next_chart_id"] = st.session_state.get("next_chart_id", 0) + 1
     return {
         "id": st.session_state["next_chart_id"],
         "name": name,
+        "chart_type": chart_type,
         "vars": [],
         "layout": "combined",
         "time_range": None,
+        "x_var": None,
     }
 
 
@@ -144,8 +268,26 @@ def _time_bounds(var_list: list[str]) -> tuple[float, float] | None:
 # Sidebar: variable editor (edits the ACTIVE chart)
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    chart_type = active_chart.get("chart_type", "time")
+    is_dependent = chart_type == "dependent"
+
     st.header(f"Variables — editing “{active_chart['name']}”")
     top_level_names = [n for n in all_var_names if "." not in n]
+
+    if is_dependent:
+        xvar_key = _widget_key("xvar", active_id)
+        if xvar_key not in st.session_state or st.session_state[xvar_key] not in all_var_names:
+            default_x = active_chart.get("x_var")
+            st.session_state[xvar_key] = default_x if default_x in all_var_names else (
+                all_var_names[0] if all_var_names else None
+            )
+        st.selectbox(
+            "X-axis variable",
+            options=all_var_names,
+            key=xvar_key,
+            help="The variable plotted on the horizontal axis.",
+        )
+        active_chart["x_var"] = st.session_state[xvar_key]
 
     vars_key = _widget_key("vars", active_id)
     sane_vars = [v for v in active_chart["vars"] if v in all_var_names]
@@ -155,7 +297,7 @@ with st.sidebar:
         st.session_state[vars_key] = [v for v in st.session_state[vars_key] if v in all_var_names]
 
     st.multiselect(
-        "Variables to plot",
+        "Y-axis variable(s)" if is_dependent else "Variables to plot",
         options=all_var_names,
         key=vars_key,
         help=(
@@ -208,47 +350,154 @@ with st.sidebar:
     st.text_input("Chart name", key=name_key)
     active_chart["name"] = st.session_state[name_key] or active_chart["name"]
 
-    layout_key = _widget_key("layout", active_id)
-    if layout_key not in st.session_state:
-        st.session_state[layout_key] = active_chart["layout"]
-    st.radio(
-        "Chart layout",
-        options=["combined", "subplot"],
-        key=layout_key,
-        format_func=lambda v: "One combined chart" if v == "combined" else "Separate subplot per variable",
-        help=(
-            "Combined: all selected variables overlaid on one chart "
-            "(up to 2 distinct units get their own y-axis). "
-            "Separate: one subplot per variable, each with its own y-scale."
-        ),
-    )
-    active_chart["layout"] = st.session_state[layout_key]
-
-    bounds = _time_bounds(active_chart["vars"])
-    if bounds is None:
-        st.caption("Pick variables above to enable the time window.")
+    if is_dependent:
+        st.caption("Dependent (X-Y) chart — plots the Y variable(s) against the X variable, combined in one figure.")
         active_chart["time_range"] = None
     else:
-        t_min, t_max = bounds
-        if t_max <= t_min:
-            active_chart["time_range"] = (t_min, t_max)
+        layout_key = _widget_key("layout", active_id)
+        if layout_key not in st.session_state:
+            st.session_state[layout_key] = active_chart["layout"]
+        st.radio(
+            "Chart layout",
+            options=["combined", "subplot"],
+            key=layout_key,
+            format_func=lambda v: "One combined chart" if v == "combined" else "Separate subplot per variable",
+            help=(
+                "Combined: all selected variables overlaid on one chart "
+                "(up to 2 distinct units get their own y-axis). "
+                "Separate: one subplot per variable, each with its own y-scale."
+            ),
+        )
+        active_chart["layout"] = st.session_state[layout_key]
+
+        bounds = _time_bounds(active_chart["vars"])
+        if bounds is None:
+            st.caption("Pick variables above to enable the time window.")
+            active_chart["time_range"] = None
         else:
-            time_key = _widget_key("time", active_id)
-            if time_key not in st.session_state:
-                st.session_state[time_key] = (t_min, t_max)
+            t_min, t_max = bounds
+            if t_max <= t_min:
+                active_chart["time_range"] = (t_min, t_max)
             else:
-                lo, hi = st.session_state[time_key]
-                lo = min(max(lo, t_min), t_max)
-                hi = min(max(hi, t_min), t_max)
-                st.session_state[time_key] = (lo, hi) if lo <= hi else (t_min, t_max)
-            st.slider("Time window [s]", min_value=t_min, max_value=t_max, key=time_key)
-            active_chart["time_range"] = st.session_state[time_key]
+                time_key = _widget_key("time", active_id)
+                if time_key not in st.session_state:
+                    stored_range = active_chart.get("time_range")
+                    if stored_range and len(stored_range) == 2:
+                        lo = min(max(stored_range[0], t_min), t_max)
+                        hi = min(max(stored_range[1], t_min), t_max)
+                        st.session_state[time_key] = (lo, hi) if lo <= hi else (t_min, t_max)
+                    else:
+                        st.session_state[time_key] = (t_min, t_max)
+                else:
+                    lo, hi = st.session_state[time_key]
+                    lo = min(max(lo, t_min), t_max)
+                    hi = min(max(hi, t_min), t_max)
+                    st.session_state[time_key] = (lo, hi) if lo <= hi else (t_min, t_max)
+                st.slider("Time window [s]", min_value=t_min, max_value=t_max, key=time_key)
+                active_chart["time_range"] = st.session_state[time_key]
 
 
 # ---------------------------------------------------------------------------
 # Chart data / figure builders
 # ---------------------------------------------------------------------------
 def build_chart_df(chart: dict, results_list: list[ResultFile]) -> pd.DataFrame:
+    if chart.get("chart_type") == "dependent":
+        return build_dependent_chart_df(chart, results_list)
+    return build_time_chart_df(chart, results_list)
+
+
+def render_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[ResultFile]) -> go.Figure:
+    if chart.get("chart_type") == "dependent":
+        return render_dependent_chart_figure(chart, df, results_list)
+    return render_time_chart_figure(chart, df, results_list)
+
+
+def build_dependent_chart_df(chart: dict, results_list: list[ResultFile]) -> pd.DataFrame:
+    """One row per (file, y-variable, sample): y resampled onto the x variable's time grid."""
+    x_var = chart.get("x_var")
+    y_vars = chart.get("vars", [])
+    if not x_var or not y_vars:
+        return pd.DataFrame()
+    frames = []
+    for rf in results_list:
+        if x_var not in rf.series:
+            continue
+        t_x = rf.time[x_var]
+        v_x = rf.series[x_var]
+        x_unit = rf.units.get(x_var, "")
+        for y in y_vars:
+            if y not in rf.series or y == x_var:
+                continue
+            t_y = rf.time[y]
+            v_y = rf.series[y]
+            if len(t_y) == len(t_x) and np.allclose(t_y, t_x):
+                v_y_aligned = v_y
+            else:
+                order = np.argsort(t_y)
+                v_y_aligned = np.interp(t_x, t_y[order], v_y[order])
+            y_unit = rf.units.get(y, "")
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "x": v_x,
+                        "y": v_y_aligned,
+                        "y_var": y,
+                        "y_unit": y_unit,
+                        "x_unit": x_unit,
+                        "file": rf.label,
+                    }
+                )
+            )
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def render_dependent_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[ResultFile]) -> go.Figure:
+    x_var = chart.get("x_var", "")
+    x_unit = df["x_unit"].iloc[0] if not df.empty else ""
+    y_vars_ordered = [v for v in chart.get("vars", []) if v in set(df["y_var"])]
+
+    palette = px.colors.qualitative.Plotly
+    color_map = {v: palette[i % len(palette)] for i, v in enumerate(y_vars_ordered)}
+    file_labels_ordered = [rf.label for rf in results_list]
+    dash_map = {lbl: DASH_STYLES[i % len(DASH_STYLES)] for i, lbl in enumerate(file_labels_ordered)}
+    multi_file = len(results_list) > 1
+
+    fig = go.Figure()
+    for y in y_vars_ordered:
+        for lbl in file_labels_ordered:
+            sub = df[(df["y_var"] == y) & (df["file"] == lbl)]
+            if sub.empty:
+                continue
+            unit = sub["y_unit"].iloc[0]
+            name = f"{y} [{unit}]" if unit else y
+            if multi_file:
+                name += f" — {lbl}"
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["x"],
+                    y=sub["y"],
+                    mode="lines+markers",
+                    name=name,
+                    legendgroup=y,
+                    line=dict(color=color_map[y], dash=dash_map[lbl]),
+                    marker=dict(size=4, color=color_map[y]),
+                )
+            )
+
+    fig.update_layout(
+        legend_title_text="",
+        margin=dict(t=40, b=20),
+        height=350,
+        hovermode="closest",
+        hoverlabel=dict(font_size=16),
+    )
+    x_label = f"{x_var} [{x_unit}]" if x_unit else x_var
+    fig.update_xaxes(title_text=x_label)
+    fig.update_yaxes(title_text="value")
+    return fig
+
+
+def build_time_chart_df(chart: dict, results_list: list[ResultFile]) -> pd.DataFrame:
     t_range = chart["time_range"]
     frames = []
     for rf in results_list:
@@ -278,7 +527,7 @@ def build_chart_df(chart: dict, results_list: list[ResultFile]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def render_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[ResultFile]) -> go.Figure:
+def render_time_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[ResultFile]) -> go.Figure:
     if chart["layout"] == "subplot":
         n_vars = df["variable"].nunique()
         fig = px.line(
@@ -287,7 +536,7 @@ def render_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[Result
             y="value",
             color="file",
             facet_row="variable_label",
-            height=max(300, 260 * n_vars),
+            height=max(220, 180 * n_vars),
         )
         fig.update_yaxes(matches=None)
         fig.for_each_annotation(lambda a: a.update(text=a.text.split("=", 1)[-1]))
@@ -338,7 +587,7 @@ def render_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[Result
     fig.update_layout(
         legend_title_text="",
         margin=dict(t=40, b=20),
-        height=500,
+        height=350,
         hovermode="x unified",
         hoverlabel=dict(font_size=16),
     )
@@ -357,7 +606,7 @@ def render_chart_figure(chart: dict, df: pd.DataFrame, results_list: list[Result
 
 
 def _cleanup_chart_state(chart_id: int) -> None:
-    for field in ("vars", "name", "layout", "time"):
+    for field in ("vars", "name", "layout", "time", "xvar"):
         st.session_state.pop(_widget_key(field, chart_id), None)
 
 
@@ -367,13 +616,47 @@ def _chart_header(chart: dict, is_active: bool) -> None:
         if is_active
         else "border-left:4px solid rgba(128,128,128,0.35);"
     )
+    badge = (
+        " <span style='font-size:0.75em; opacity:0.65;'>(X-Y)</span>"
+        if chart.get("chart_type") == "dependent"
+        else ""
+    )
     st.markdown(
-        f"<div style='{border_css} padding:6px 10px; border-radius:4px;'><b>{chart['name']}</b></div>",
+        f"<div style='{border_css} padding:6px 10px; border-radius:4px;'><b>{chart['name']}</b>{badge}</div>",
         unsafe_allow_html=True,
     )
 
 
 def _render_chart_plot(chart: dict, results_list: list[ResultFile], slot: str, csv_label: str) -> None:
+    if chart.get("chart_type") == "dependent":
+        x_var = chart.get("x_var")
+        y_vars = chart.get("vars", [])
+        if not x_var or not y_vars:
+            st.info("Pick an X-axis variable and at least one Y-axis variable for this chart.")
+            return
+        if not any(x_var in rf.series for rf in results_list):
+            st.info(f"X variable '{x_var}' not found in this file.")
+            return
+        matched_y = [v for v in y_vars if any(v in rf.series for rf in results_list)]
+        if not matched_y:
+            st.info("None of this chart's Y variables exist in this file.")
+            return
+        scoped_chart = dict(chart, vars=matched_y)
+        chart_df = build_chart_df(scoped_chart, results_list)
+        if chart_df.empty:
+            st.warning("No data available for the chosen X/Y variables.")
+            return
+        fig = render_chart_figure(scoped_chart, chart_df, results_list)
+        st.plotly_chart(fig, width="stretch", key=f"plotly_{chart['id']}_{slot}")
+        st.download_button(
+            "Download CSV",
+            data=chart_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{chart['name'].replace(' ', '_')}_{csv_label.replace(' ', '_')}.csv",
+            mime="text/csv",
+            key=f"dl_{chart['id']}_{slot}",
+        )
+        return
+
     matched_vars = [v for v in chart["vars"] if any(v in rf.series for rf in results_list)]
     if not chart["vars"]:
         st.info("No variables selected for this chart yet.")
@@ -433,11 +716,19 @@ with tab_charts:
                 _render_chart_plot(chart, [col_b_result], slot="B", csv_label=col_b_result.label)
 
     st.divider()
-    if st.button("+ New chart", width="stretch"):
-        new_chart = _new_chart(f"Chart {len(charts) + 1}")
-        charts.append(new_chart)
-        st.session_state["active_chart_id"] = new_chart["id"]
-        st.rerun()
+    _, new_chart_col_a, new_chart_col_b, _ = st.columns([3, 1, 1, 3])
+    with new_chart_col_a:
+        if st.button("New Time Chart", width="stretch"):
+            new_chart = _new_chart(f"Chart {len(charts) + 1}", chart_type="time")
+            charts.append(new_chart)
+            st.session_state["active_chart_id"] = new_chart["id"]
+            st.rerun()
+    with new_chart_col_b:
+        if st.button("New Dependant Chart", width="stretch"):
+            new_chart = _new_chart(f"Chart {len(charts) + 1}", chart_type="dependent")
+            charts.append(new_chart)
+            st.session_state["active_chart_id"] = new_chart["id"]
+            st.rerun()
 
 with tab_params:
     param_names = parameter_names(results)
@@ -502,3 +793,9 @@ with tab_data:
             )
         if skipped:
             st.caption(f"Skipped (different time grid than the first variable): {', '.join(skipped)}")
+
+# ---------------------------------------------------------------------------
+# Persist current settings so the same directory, files and charts come
+# back the next time the app is opened.
+# ---------------------------------------------------------------------------
+save_settings()
